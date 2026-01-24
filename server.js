@@ -32,9 +32,9 @@ app.post('/api/ocr', upload.single('pdf'), async (req, res) => {
 
     console.log('Processing OCR for:', inputPath);
 
-    const command = `ocrmypdf --force-ocr --deskew --clean --optimize 3 "${inputPath}" "${outputPath}"`;
+    const command = `ocrmypdf --force-ocr "${inputPath}" "${outputPath}"`;
 
-    exec(command, (error, stdout, stderr) => {
+    exec(command, { timeout: 120000 }, (error, stdout, stderr) => {
       fs.unlinkSync(inputPath);
 
       if (error) {
