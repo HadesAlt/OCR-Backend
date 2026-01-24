@@ -8,8 +8,6 @@ RUN apt-get update && apt-get install -y \
     unpaper \
     pngquant \
     qpdf \
-    jbig2enc \
-    img2pdf \
     python3 \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
