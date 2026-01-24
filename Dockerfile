@@ -1,11 +1,15 @@
 FROM node:18-bullseye
 
-# Install system dependencies for OCR
+# Install ALL system dependencies for OCR in one go
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
     ghostscript \
     unpaper \
+    pngquant \
+    qpdf \
+    jbig2enc \
+    img2pdf \
     python3 \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
