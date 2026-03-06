@@ -63,7 +63,10 @@ function generateLicenseKey() {
  * NOTE: No "status" field. No companion app → amount may be "0" or empty.
  */
 app.post('/api/payment-webhook', (req, res) => {
-  console.log('[webhook] Received payload:', JSON.stringify(req.body));
+  console.log('\n[webhook] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('[webhook] Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('[webhook] Body:', JSON.stringify(req.body, null, 2));
+  console.log('[webhook] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   // UroPay sends referenceNumber (not payment_reference)
   const { referenceNumber, amount, from, vpa } = req.body;
@@ -121,22 +124,29 @@ app.post('/api/payment-webhook', (req, res) => {
  */
 app.post('/api/get-license', (req, res) => {
   const { upiRef } = req.body;
+  console.log('[get-license] Looking up UPI ref:', upiRef);
+
   if (!upiRef || !upiRef.trim()) {
     return res.status(400).json({ error: 'UPI reference number is required.' });
   }
 
   const licenses = readLicenses();
+  console.log('[get-license] Total licenses in store:', Object.keys(licenses).length);
+  console.log('[get-license] All stored refs:', Object.values(licenses).map(l => l.upiRef));
+
   const entry = Object.entries(licenses).find(
     ([, v]) => v.upiRef && v.upiRef.toUpperCase() === upiRef.trim().toUpperCase()
   );
 
   if (!entry) {
+    console.log('[get-license] NOT FOUND for ref:', upiRef.trim().toUpperCase());
     return res.status(404).json({
       error: 'No license found for this UPI reference. If you just paid, please wait 1–2 minutes and try again.'
     });
   }
 
   const [licenseKey, data] = entry;
+  console.log('[get-license] Found license:', licenseKey, '| activated:', !!data.deviceFingerprint);
   res.json({
     licenseKey,
     alreadyActivated: !!data.deviceFingerprint
