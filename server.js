@@ -93,7 +93,8 @@ app.post('/api/payment-webhook', webhookLimiter, (req, res) => {
     log('webhook', 'WARN: WEBHOOK_SECRET not set');
   }
 
-  const secretVerified = !WEBHOOK_SECRET || (req.query.secret === WEBHOOK_SECRET || req.headers['x-webhook-secret'] === WEBHOOK_SECRET);
+  const secretVerified = !!(WEBHOOK_SECRET &&
+    (req.query.secret === WEBHOOK_SECRET || req.headers['x-webhook-secret'] === WEBHOOK_SECRET));
   const { referenceNumber, amount, from, vpa } = req.body;
   const ref = (referenceNumber || '').toString().trim();
   const paid = parseFloat(amount) || 0;
@@ -103,13 +104,16 @@ app.post('/api/payment-webhook', webhookLimiter, (req, res) => {
     return res.status(200).json({ message: 'No reference number' });
   }
 
-  if (!secretVerified && (!Number.isFinite(paid) || paid !== EXPECTED_AMOUNT)) {
-    log('webhook', `Unauthenticated call with bad amount ₹${paid} — rejected`);
-    return res.status(200).json({ message: 'Incorrect amount' });
-  }
-  if (secretVerified && paid > 0 && paid !== EXPECTED_AMOUNT) {
-    log('webhook', `Amount ₹${paid} !== ₹${EXPECTED_AMOUNT} — rejected`);
-    return res.status(200).json({ message: 'Incorrect amount' });
+  if (secretVerified) {
+    if (paid > 0 && paid !== EXPECTED_AMOUNT) {
+      log('webhook', `Amount ₹${paid} !== ₹${EXPECTED_AMOUNT} — rejected`);
+      return res.status(200).json({ message: 'Incorrect amount' });
+    }
+  } else {
+    if (paid !== EXPECTED_AMOUNT) {
+      log('webhook', `Unauthenticated: ₹${paid} rejected (must be exactly ₹${EXPECTED_AMOUNT})`);
+      return res.status(200).json({ message: 'Incorrect amount' });
+    }
   }
 
   const licenseKey = generateLicenseKey();
