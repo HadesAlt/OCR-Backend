@@ -56,47 +56,50 @@ function generateLicenseKey() {
 
 /**
  * POST /api/payment-webhook
- * Called by UroPay companion app when a UPI credit SMS is detected.
- * Generates a license key and stores it mapped to the UPI reference.
+ * Called by UroPay when a UPI credit SMS is detected via companion app,
+ * or when an order is manually updated.
+ *
+ * UroPay payload: { amount: "29.00", referenceNumber: "430686551035", from: "...", vpa: "..." }
+ * NOTE: No "status" field. No companion app → amount may be "0" or empty.
  */
 app.post('/api/payment-webhook', (req, res) => {
   console.log('[webhook] Received payload:', JSON.stringify(req.body));
 
-  const { payment_reference, amount, status, order_id, api_key } = req.body;
+  // UroPay sends referenceNumber (not payment_reference)
+  const { referenceNumber, amount, from, vpa } = req.body;
 
-  // Optional: verify it came from our UroPay account
-  if (api_key && api_key !== UROPAY_API_KEY) {
-    console.warn('[webhook] API key mismatch — ignoring');
-    return res.status(403).json({ error: 'Unauthorized' });
+  const ref = (referenceNumber || '').toString().trim();
+  const paid = parseFloat(amount) || 0;
+
+  if (!ref) {
+    console.log('[webhook] No referenceNumber — ignoring');
+    return res.status(200).json({ message: 'No reference number, ignored' });
   }
 
-  if (!status || status.toUpperCase() !== 'SUCCESS') {
-    console.log('[webhook] Non-success status, ignoring:', status);
-    return res.status(200).json({ message: 'Non-success event ignored' });
-  }
-
-  if (parseFloat(amount) < EXPECTED_AMOUNT) {
+  // Accept payment if amount matches OR if no companion app (amount = 0)
+  // If amount > 0, it must be >= EXPECTED_AMOUNT
+  if (paid > 0 && paid < EXPECTED_AMOUNT) {
     console.warn('[webhook] Incorrect amount:', amount);
     return res.status(200).json({ message: 'Incorrect amount ignored' });
   }
 
   const licenses = readLicenses();
 
-  // Deduplicate — don't issue two keys for the same payment
+  // Deduplicate — don't issue two keys for the same payment reference
   const alreadyExists = Object.values(licenses).find(
-    l => (payment_reference && l.upiRef === payment_reference) ||
-         (order_id && l.orderId === order_id)
+    l => l.upiRef && l.upiRef.toUpperCase() === ref.toUpperCase()
   );
   if (alreadyExists) {
-    console.log('[webhook] Already processed, skipping');
+    console.log('[webhook] Already processed ref:', ref);
     return res.status(200).json({ message: 'Already processed' });
   }
 
   const licenseKey = generateLicenseKey();
   licenses[licenseKey] = {
-    upiRef: payment_reference || null,
-    orderId: order_id || null,
-    amount: parseFloat(amount),
+    upiRef: ref,
+    from: from || null,
+    vpa: vpa || null,
+    amount: paid,
     issuedAt: new Date().toISOString(),
     deviceFingerprint: null,
     activatedAt: null,
@@ -104,10 +107,12 @@ app.post('/api/payment-webhook', (req, res) => {
   };
 
   writeLicenses(licenses);
-  console.log('[webhook] License key issued:', licenseKey);
+  console.log('[webhook] License key issued:', licenseKey, 'for ref:', ref);
 
+  // Must respond 200 or UroPay marks the call as FAILED
   res.status(200).json({ success: true, licenseKey });
 });
+
 
 /**
  * POST /api/get-license
@@ -191,8 +196,8 @@ app.get('/api/validate-license', (req, res) => {
   const licenses = readLicenses();
   const entry = licenses[key.trim().toUpperCase()];
 
-  if (!entry)           return res.json({ valid: false, error: 'Invalid license key' });
-  if (!entry.active)    return res.json({ valid: false, error: 'License deactivated' });
+  if (!entry) return res.json({ valid: false, error: 'Invalid license key' });
+  if (!entry.active) return res.json({ valid: false, error: 'License deactivated' });
   if (!entry.deviceFingerprint) return res.json({ valid: false, error: 'License not yet activated' });
   if (entry.deviceFingerprint !== fp) return res.json({ valid: false, error: 'Wrong device' });
 
