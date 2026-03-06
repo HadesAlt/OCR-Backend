@@ -1,242 +1,203 @@
+'use strict';
+
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
+const helmet = require('helmet');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const Database = require('better-sqlite3');
+const rateLimit = require('express-rate-limit');
 
-const app = express();
 const PORT = process.env.PORT || 3001;
-
-// ── License config ──────────────────────────────────────────────────────────
-const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 const EXPECTED_AMOUNT = 29;
-const UROPAY_API_KEY = process.env.UROPAY_API_KEY || 'NR86ZTDJ7ZDTX1MW1Z6SR4FIW85GM9YT';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// ── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({
-  origin: [
-    'https://resumebuilder-theta-seven.vercel.app',
-    'http://localhost:5173',
-    'http://localhost:3000'
-  ],
-  credentials: true
-}));
-app.use(express.json());
+const DB_PATH = path.join(__dirname, 'licenses.db');
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
-// ── File upload setup ────────────────────────────────────────────────────────
-const upload = multer({ dest: 'uploads/' });
+db.exec(`
+  CREATE TABLE IF NOT EXISTS licenses (
+    licenseKey        TEXT PRIMARY KEY,
+    upiRef            TEXT UNIQUE NOT NULL,
+    amount            REAL NOT NULL,
+    fromName          TEXT,
+    vpa               TEXT,
+    issuedAt          TEXT NOT NULL,
+    deviceFingerprint TEXT,
+    activatedAt       TEXT,
+    active            INTEGER NOT NULL DEFAULT 1
+  );
+  CREATE INDEX IF NOT EXISTS idx_upiRef ON licenses(upiRef);
+`);
 
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
-if (!fs.existsSync('output')) fs.mkdirSync('output');
-
-// ── License helpers ──────────────────────────────────────────────────────────
-function readLicenses() {
-  if (!fs.existsSync(LICENSES_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(LICENSES_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
-function writeLicenses(data) {
-  fs.writeFileSync(LICENSES_FILE, JSON.stringify(data, null, 2));
-}
+const stmts = {
+  insert: db.prepare(`INSERT OR IGNORE INTO licenses (licenseKey, upiRef, amount, fromName, vpa, issuedAt, deviceFingerprint, activatedAt, active) VALUES (@licenseKey, @upiRef, @amount, @fromName, @vpa, @issuedAt, NULL, NULL, 1)`),
+  findByRef: db.prepare(`SELECT * FROM licenses WHERE UPPER(upiRef) = UPPER(@upiRef) LIMIT 1`),
+  findByKey: db.prepare(`SELECT * FROM licenses WHERE licenseKey = @licenseKey LIMIT 1`),
+  activate: db.prepare(`UPDATE licenses SET deviceFingerprint = @fp, activatedAt = @ts WHERE licenseKey = @licenseKey AND deviceFingerprint IS NULL`),
+  validate: db.prepare(`SELECT active, deviceFingerprint FROM licenses WHERE licenseKey = @key LIMIT 1`),
+};
 
 function generateLicenseKey() {
   const part = () => crypto.randomBytes(4).toString('hex').toUpperCase();
   return `RB-${part()}-${part()}-${part()}`;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-//  LICENSE ENDPOINTS
-// ────────────────────────────────────────────────────────────────────────────
+function log(tag, ...args) {
+  console.log(`[${new Date().toISOString()}] [${tag}]`, ...args);
+}
 
-/**
- * POST /api/payment-webhook
- * Called by UroPay when a UPI credit SMS is detected via companion app,
- * or when an order is manually updated.
- *
- * UroPay payload: { amount: "29.00", referenceNumber: "430686551035", from: "...", vpa: "..." }
- * NOTE: No "status" field. No companion app → amount may be "0" or empty.
- */
-app.post('/api/payment-webhook', (req, res) => {
-  console.log('\n[webhook] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('[webhook] Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('[webhook] Body:', JSON.stringify(req.body, null, 2));
-  console.log('[webhook] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+const app = express();
 
-  // UroPay sends referenceNumber (not payment_reference)
+app.set('trust proxy', 1);
+app.use(helmet());
+app.use(cors({
+  origin: ['https://resumebuilder-theta-seven.vercel.app', 'http://localhost:5173', 'http://localhost:3000'],
+  credentials: true,
+}));
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: false, limit: '10kb' }));
+
+const upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === 'application/pdf') cb(null, true);
+    else cb(new Error('Only PDF files are allowed'));
+  },
+});
+if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+if (!fs.existsSync('output')) fs.mkdirSync('output');
+
+const getLicenseLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Too many requests. Please wait a few minutes.' } });
+const activateLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: 'Too many activation attempts. Try again in an hour.' } });
+const validateLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, message: { error: 'Too many requests.' } });
+const webhookLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Too many webhook calls.' } });
+
+app.post('/api/payment-webhook', webhookLimiter, (req, res) => {
+  log('webhook', 'query =', JSON.stringify(req.query));
+  log('webhook', 'body  =', JSON.stringify(req.body));
+
+  if (WEBHOOK_SECRET) {
+    const provided = req.query.secret || req.headers['x-webhook-secret'];
+    if (!provided || provided !== WEBHOOK_SECRET) {
+      log('webhook', 'REJECTED — bad secret');
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+  } else {
+    log('webhook', 'WARN: WEBHOOK_SECRET not set');
+  }
+
   const { referenceNumber, amount, from, vpa } = req.body;
-
   const ref = (referenceNumber || '').toString().trim();
   const paid = parseFloat(amount) || 0;
 
   if (!ref) {
-    console.log('[webhook] No referenceNumber — ignoring');
-    return res.status(200).json({ message: 'No reference number, ignored' });
+    log('webhook', 'Missing referenceNumber');
+    return res.status(200).json({ message: 'No reference number' });
   }
 
-  // Accept payment if amount matches OR if no companion app (amount = 0)
-  // If amount > 0, it must be >= EXPECTED_AMOUNT
-  if (paid > 0 && paid < EXPECTED_AMOUNT) {
-    console.warn('[webhook] Incorrect amount:', amount);
-    return res.status(200).json({ message: 'Incorrect amount ignored' });
-  }
-
-  const licenses = readLicenses();
-
-  // Deduplicate — don't issue two keys for the same payment reference
-  const alreadyExists = Object.values(licenses).find(
-    l => l.upiRef && l.upiRef.toUpperCase() === ref.toUpperCase()
-  );
-  if (alreadyExists) {
-    console.log('[webhook] Already processed ref:', ref);
-    return res.status(200).json({ message: 'Already processed' });
+  if (!Number.isFinite(paid) || paid !== EXPECTED_AMOUNT) {
+    log('webhook', `Amount ₹${paid} rejected — must be exactly ₹${EXPECTED_AMOUNT}`);
+    return res.status(200).json({ message: 'Incorrect amount' });
   }
 
   const licenseKey = generateLicenseKey();
-  licenses[licenseKey] = {
-    upiRef: ref,
-    from: from || null,
-    vpa: vpa || null,
-    amount: paid,
-    issuedAt: new Date().toISOString(),
-    deviceFingerprint: null,
-    activatedAt: null,
-    active: true
-  };
+  const info = stmts.insert.run({ licenseKey, upiRef: ref, amount: paid, fromName: from || null, vpa: vpa || null, issuedAt: new Date().toISOString() });
 
-  writeLicenses(licenses);
-  console.log('[webhook] License key issued:', licenseKey, 'for ref:', ref);
+  if (info.changes === 0) {
+    log('webhook', 'Duplicate ref:', ref);
+    return res.status(200).json({ message: 'Already processed' });
+  }
 
-  // Must respond 200 or UroPay marks the call as FAILED
-  res.status(200).json({ success: true, licenseKey });
+  log('webhook', 'License issued:', licenseKey, '| ref:', ref);
+  return res.status(200).json({ success: true, licenseKey });
 });
 
-
-/**
- * POST /api/get-license
- * User submits their UPI transaction reference to retrieve their license key.
- * This is the fallback if the webhook hasn't fired yet or user needs to re-enter key.
- */
-app.post('/api/get-license', (req, res) => {
+app.post('/api/get-license', getLicenseLimiter, (req, res) => {
   const { upiRef } = req.body;
-  console.log('[get-license] Looking up UPI ref:', upiRef);
+  log('get-license', 'Lookup:', upiRef);
 
   if (!upiRef || !upiRef.trim()) {
     return res.status(400).json({ error: 'UPI reference number is required.' });
   }
 
-  const licenses = readLicenses();
-  console.log('[get-license] Total licenses in store:', Object.keys(licenses).length);
-  console.log('[get-license] All stored refs:', Object.values(licenses).map(l => l.upiRef));
-
-  const entry = Object.entries(licenses).find(
-    ([, v]) => v.upiRef && v.upiRef.toUpperCase() === upiRef.trim().toUpperCase()
-  );
-
-  if (!entry) {
-    console.log('[get-license] NOT FOUND for ref:', upiRef.trim().toUpperCase());
-    return res.status(404).json({
-      error: 'No license found for this UPI reference. If you just paid, please wait 1–2 minutes and try again.'
-    });
+  const row = stmts.findByRef.get({ upiRef: upiRef.trim() });
+  if (!row) {
+    log('get-license', 'NOT FOUND:', upiRef.trim());
+    return res.status(404).json({ error: 'No license found for this UPI reference. If you just paid, please wait 1–2 minutes and try again.' });
   }
 
-  const [licenseKey, data] = entry;
-  console.log('[get-license] Found license:', licenseKey, '| activated:', !!data.deviceFingerprint);
-  res.json({
-    licenseKey,
-    alreadyActivated: !!data.deviceFingerprint
-  });
+  log('get-license', 'Found:', row.licenseKey, '| activated:', !!row.deviceFingerprint);
+  return res.json({ licenseKey: row.licenseKey, alreadyActivated: !!row.deviceFingerprint });
 });
 
-/**
- * POST /api/activate-license
- * Binds a device fingerprint to a license key (one-time, irreversible).
- */
-app.post('/api/activate-license', (req, res) => {
+app.post('/api/activate-license', activateLimiter, (req, res) => {
   const { licenseKey, fingerprint } = req.body;
 
   if (!licenseKey || !fingerprint) {
     return res.status(400).json({ error: 'License key and device fingerprint are required.' });
   }
 
-  const licenses = readLicenses();
-  const entry = licenses[licenseKey.trim().toUpperCase()];
+  const key = licenseKey.trim().toUpperCase();
+  const row = stmts.findByKey.get({ licenseKey: key });
 
-  if (!entry) {
-    return res.status(404).json({ error: 'Invalid license key. Please check and try again.' });
+  if (!row) return res.status(404).json({ error: 'Invalid license key. Please check and try again.' });
+  if (!row.active) return res.status(403).json({ error: 'This license has been deactivated.' });
+
+  if (row.deviceFingerprint && row.deviceFingerprint !== fingerprint) {
+    log('activate', 'Device mismatch:', key);
+    return res.status(403).json({ error: 'This license is already activated on another device. Each license works on only 1 device.' });
   }
 
-  if (!entry.active) {
-    return res.status(403).json({ error: 'This license has been deactivated.' });
+  if (row.deviceFingerprint === fingerprint) {
+    return res.json({ success: true, message: 'License activated! Welcome to Resume Builder.' });
   }
 
-  // Already activated on a DIFFERENT device → block
-  if (entry.deviceFingerprint && entry.deviceFingerprint !== fingerprint) {
-    return res.status(403).json({
-      error: 'This license is already activated on another device. Each license works on only 1 device.'
-    });
+  const result = stmts.activate.run({ fp: fingerprint, ts: new Date().toISOString(), licenseKey: key });
+  if (result.changes === 0) {
+    const fresh = stmts.findByKey.get({ licenseKey: key });
+    if (fresh.deviceFingerprint !== fingerprint) {
+      return res.status(403).json({ error: 'License was just activated on another device.' });
+    }
   }
 
-  // First activation — bind fingerprint
-  if (!entry.deviceFingerprint) {
-    entry.deviceFingerprint = fingerprint;
-    entry.activatedAt = new Date().toISOString();
-    writeLicenses(licenses);
-  }
-
-  res.json({ success: true, message: 'License activated! Welcome to Resume Builder.' });
+  log('activate', 'Activated:', key);
+  return res.json({ success: true, message: 'License activated! Welcome to Resume Builder.' });
 });
 
-/**
- * GET /api/validate-license?key=XXX&fp=YYY
- * Called on every app load to silently verify the stored license.
- */
-app.get('/api/validate-license', (req, res) => {
+app.get('/api/validate-license', validateLimiter, (req, res) => {
   const { key, fp } = req.query;
+  if (!key || !fp) return res.json({ valid: false, error: 'Missing parameters' });
 
-  if (!key || !fp) {
-    return res.json({ valid: false, error: 'Missing parameters' });
-  }
+  const row = stmts.validate.get({ key: key.trim().toUpperCase() });
+  if (!row) return res.json({ valid: false, error: 'Invalid license key' });
+  if (!row.active) return res.json({ valid: false, error: 'License deactivated' });
+  if (!row.deviceFingerprint) return res.json({ valid: false, error: 'License not yet activated' });
+  if (row.deviceFingerprint !== fp) return res.json({ valid: false, error: 'Wrong device' });
 
-  const licenses = readLicenses();
-  const entry = licenses[key.trim().toUpperCase()];
-
-  if (!entry) return res.json({ valid: false, error: 'Invalid license key' });
-  if (!entry.active) return res.json({ valid: false, error: 'License deactivated' });
-  if (!entry.deviceFingerprint) return res.json({ valid: false, error: 'License not yet activated' });
-  if (entry.deviceFingerprint !== fp) return res.json({ valid: false, error: 'Wrong device' });
-
-  res.json({ valid: true });
+  return res.json({ valid: true });
 });
 
-// ────────────────────────────────────────────────────────────────────────────
-//  OCR ENDPOINT (existing)
-// ────────────────────────────────────────────────────────────────────────────
 app.post('/api/ocr', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
-
     const inputPath = req.file.path;
-    const outputFilename = `ocr_${Date.now()}.pdf`;
-    const outputPath = path.join('output', outputFilename);
-    const command = `ocrmypdf --force-ocr "${inputPath}" "${outputPath}"`;
-
-    exec(command, { timeout: 120000 }, (error, stdout, stderr) => {
-      fs.unlinkSync(inputPath);
-
+    const outputPath = path.join('output', `ocr_${Date.now()}.pdf`);
+    exec(`ocrmypdf --force-ocr "${inputPath}" "${outputPath}"`, { timeout: 120000 }, (error, _stdout, stderr) => {
+      try { fs.unlinkSync(inputPath); } catch (_) { }
       if (error) {
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) { }
         return res.status(500).json({ error: 'OCR processing failed', details: stderr || error.message });
       }
-
       res.download(outputPath, 'resume_searchable.pdf', (err) => {
-        if (err) console.error('Download error:', err);
-        setTimeout(() => { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); }, 5000);
+        if (err) log('ocr', 'Download error:', err.message);
+        setTimeout(() => { try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) { } }, 5000);
       });
     });
   } catch (error) {
@@ -244,19 +205,11 @@ app.post('/api/ocr', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// ── Health ───────────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.get('/', (req, res) => res.json({
-  status: 'ok',
-  message: 'Resume Builder API',
-  endpoints: {
-    webhook: 'POST /api/payment-webhook',
-    getLicense: 'POST /api/get-license',
-    activate: 'POST /api/activate-license',
-    validate: 'GET /api/validate-license?key=&fp=',
-    ocr: 'POST /api/ocr'
-  }
+app.get('/', (_req, res) => res.json({
+  status: 'ok', message: 'Resume Builder API', storage: 'SQLite',
+  endpoints: { webhook: 'POST /api/payment-webhook', getLicense: 'POST /api/get-license', activate: 'POST /api/activate-license', validate: 'GET /api/validate-license?key=&fp=', ocr: 'POST /api/ocr' },
 }));
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => log('server', `Running on port ${PORT} | DB: ${DB_PATH}`));
